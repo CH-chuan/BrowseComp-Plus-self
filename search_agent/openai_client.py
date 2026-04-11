@@ -15,6 +15,11 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from transformers import AutoTokenizer
+from trajectory_utils import (
+    build_request_config,
+    build_trajectory_entry,
+    truncate_trajectory_tool_result,
+)
 from utils import extract_retrieved_docids_from_result
 
 from searcher.searchers import SearcherType
@@ -189,6 +194,7 @@ def run_conversation_with_tools(
     combined_output = []
     tool_outputs = {}
     all_responses = []
+    trajectory = []
 
     for iteration in range(max_iterations):
         # Calculate remaining tokens for this round
@@ -206,6 +212,16 @@ def run_conversation_with_tools(
 
         response = client.responses.create(**request)
         all_responses.append(response)
+
+        # Capture raw response for trajectory
+        raw_response_dict = response.model_dump(mode="python")
+        turn_usage = None
+        if hasattr(response, "usage") and response.usage:
+            turn_usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
 
         if hasattr(response, "output"):
             combined_output.extend(response.output)
@@ -233,13 +249,24 @@ def run_conversation_with_tools(
         ]
 
         if not function_calls:
-            return response, combined_output, cumulative_usage, tool_outputs
+            trajectory.append(
+                build_trajectory_entry(
+                    turn=iteration,
+                    raw_response=raw_response_dict,
+                    usage=turn_usage,
+                    stop_reason=getattr(response, "status", None),
+                    tool_results=[],
+                )
+            )
+            return response, combined_output, cumulative_usage, tool_outputs, trajectory
 
         for item in response.output:
             serialized_item = item.model_dump(mode="python")
             if "status" in serialized_item:
                 del serialized_item["status"]
             input_messages.append(serialized_item)
+
+        turn_tool_results = []
         for tool_call in function_calls:
             try:
                 args = json.loads(tool_call.arguments)
@@ -259,6 +286,15 @@ def run_conversation_with_tools(
                     }
                 )
 
+                turn_tool_results.append(
+                    truncate_trajectory_tool_result(
+                        call_id=tool_call.call_id,
+                        tool_name=tool_call.name,
+                        arguments=args,
+                        raw_output=result,
+                    )
+                )
+
             except Exception as e:
                 error_msg = f"Error executing {tool_call.name}: {str(e)}"
 
@@ -276,10 +312,29 @@ def run_conversation_with_tools(
                     }
                 )
 
+                turn_tool_results.append(
+                    truncate_trajectory_tool_result(
+                        call_id=tool_call.call_id,
+                        tool_name=tool_call.name,
+                        arguments=args,
+                        raw_output=error_msg,
+                    )
+                )
+
+        trajectory.append(
+            build_trajectory_entry(
+                turn=iteration,
+                raw_response=raw_response_dict,
+                usage=turn_usage,
+                stop_reason="tool_calls",
+                tool_results=turn_tool_results,
+            )
+        )
+
     print(f"Warning: Conversation hit max iterations ({max_iterations})")
 
     final_response = all_responses[-1] if all_responses else response
-    return final_response, combined_output, cumulative_usage, tool_outputs
+    return final_response, combined_output, cumulative_usage, tool_outputs, trajectory
 
 
 def _persist_response(
@@ -291,6 +346,8 @@ def _persist_response(
     tool_outputs: dict = None,
     *,
     query_id: str | None = None,
+    trajectory: list | None = None,
+    request_config: dict | None = None,
 ):
     """Persist request & response JSON for later inspection."""
 
@@ -365,28 +422,30 @@ def _persist_response(
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     filename = os.path.join(out_dir, f"run_{ts}.json")
 
+    record = {
+        "metadata": {
+            "model": request_body.get("model"),
+            "reasoning": request_body.get("reasoning"),
+            "output_dir": str(out_dir),
+            "max_tokens": request_body.get("max_output_tokens"),
+        },
+        "query_id": query_id,
+        "tool_call_counts": tool_call_counts,
+        "usage": normalized_usage,
+        "status": response.status,
+        "retrieved_docids": extract_retrieved_docids_from_result(
+            normalized_results
+        ),
+        "result": normalized_results,
+    }
+
+    if request_config is not None:
+        record["request_config"] = request_config
+    if trajectory is not None:
+        record["trajectory"] = trajectory
+
     with open(filename, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "metadata": {
-                    "model": request_body.get("model"),
-                    "reasoning": request_body.get("reasoning"),
-                    "output_dir": str(out_dir),
-                    "max_tokens": request_body.get("max_output_tokens"),
-                },
-                "query_id": query_id,
-                "tool_call_counts": tool_call_counts,
-                "usage": normalized_usage,
-                "status": response.status,
-                "retrieved_docids": extract_retrieved_docids_from_result(
-                    normalized_results
-                ),
-                "result": normalized_results,
-            },
-            f,
-            indent=2,
-            default=str,
-        )
+        json.dump(record, f, indent=2, default=str)
 
     print("Saved response to", filename, "| tool call counts:", tool_call_counts)
 
@@ -433,7 +492,17 @@ def _process_tsv_dataset(
     completed_lock = threading.Lock()
     completed_count = [0]
 
+    req_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        searcher_type=args.searcher_type,
+        snippet_max_tokens=args.snippet_max_tokens,
+        k=args.k,
+    )
+
     def _handle_single_query(qid: str, qtext: str, pbar=None):
+        formatted_query = format_query(qtext, args.query_template)
+
         request_body = build_request(
             query=qtext,
             model=args.model,
@@ -446,8 +515,10 @@ def _process_tsv_dataset(
             top_p=args.top_p,
         )
 
+        per_query_config = {**req_config, "formatted_query": formatted_query}
+
         try:
-            response, combined_output, cumulative_usage, tool_outputs = (
+            response, combined_output, cumulative_usage, tool_outputs, trajectory = (
                 run_conversation_with_tools(
                     client, request_body, tool_handler, args.max_iterations
                 )
@@ -467,6 +538,8 @@ def _process_tsv_dataset(
                 cumulative_usage,
                 tool_outputs,
                 query_id=qid,
+                trajectory=trajectory,
+                request_config=per_query_config,
             )
 
         except Exception as exc:
@@ -651,6 +724,17 @@ def main():
             except OSError:
                 pass
 
+    formatted_query = format_query(args.query, args.query_template)
+    req_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        formatted_query=formatted_query,
+        tool_definitions=tool_handler.get_tool_definitions(),
+        searcher_type=args.searcher_type,
+        snippet_max_tokens=args.snippet_max_tokens,
+        k=args.k,
+    )
+
     request_body = build_request(
         query=args.query,
         model=args.model,
@@ -664,7 +748,7 @@ def main():
     )
 
     print("Sending request to OpenAI Responses API with function calling...")
-    response, combined_output, cumulative_usage, tool_outputs = (
+    response, combined_output, cumulative_usage, tool_outputs, trajectory = (
         run_conversation_with_tools(
             client, request_body, tool_handler, args.max_iterations
         )
@@ -678,6 +762,8 @@ def main():
         cumulative_usage,
         tool_outputs,
         query_id=None,
+        trajectory=trajectory,
+        request_config=req_config,
     )
 
     rprint(response)

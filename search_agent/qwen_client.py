@@ -16,6 +16,10 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from trajectory_utils import (
+    build_request_config,
+    truncate_tool_output,
+)
 from utils import extract_retrieved_docids_from_result
 
 load_dotenv()
@@ -62,15 +66,18 @@ def build_messages(
 
 
 def _persist_response(
-    out_dir: str, request_config: dict, response, *, query_id: str | None = None
+    out_dir: str, request_conf: dict, response, *, query_id: str | None = None,
+    req_config: dict | None = None,
 ):
 
     os.makedirs(out_dir, exist_ok=True)
 
     results: list[dict] = []
     tool_counts: dict[str, int] = {}
+    trajectory: list[dict] = []
 
     i = 0
+    turn = 0
     while i < len(response):
         msg = response[i]
         role = msg.get("role")
@@ -103,6 +110,20 @@ def _persist_response(
                 }
             )
             tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+
+            # Trajectory: capture raw message + truncated tool output
+            truncated = truncate_tool_output(tool_name, output_text)
+            trajectory.append({
+                "turn": turn,
+                "raw_message": msg,
+                "tool_result": {
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    **truncated,
+                },
+            })
+            turn += 1
+
             i += 1
             continue
 
@@ -116,6 +137,12 @@ def _persist_response(
                     "output": [reasoning.strip()],
                 }
             )
+            trajectory.append({
+                "turn": turn,
+                "raw_message": msg,
+                "tool_result": None,
+            })
+            turn += 1
             i += 1
             continue
 
@@ -129,6 +156,12 @@ def _persist_response(
                     "output": content.strip(),
                 }
             )
+            trajectory.append({
+                "turn": turn,
+                "raw_message": msg,
+                "tool_result": None,
+            })
+            turn += 1
             i += 1
             continue
 
@@ -147,8 +180,8 @@ def _persist_response(
     # ------------ METADATA ----------------------------------------------------
     record = {
         "metadata": {
-            "model": request_config.get("model"),
-            "max_output_tokens": request_config.get("max_tokens"),
+            "model": request_conf.get("model"),
+            "max_output_tokens": request_conf.get("max_tokens"),
             "output_dir": str(out_dir),
         },
         "query_id": query_id,
@@ -157,6 +190,10 @@ def _persist_response(
         "retrieved_docids": extract_retrieved_docids_from_result(results),
         "result": results,
     }
+
+    if req_config is not None:
+        record["request_config"] = req_config
+    record["trajectory"] = trajectory
 
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     filename = os.path.join(out_dir, f"run_{ts}.json")
@@ -198,12 +235,25 @@ def _process_tsv_dataset(tsv_path: str, agent: Assistant, args):
         f"Processing {len(remaining)} remaining queries (skipping {len(processed_ids)}) from {dataset_path} …"
     )
 
+    base_req_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        extra={
+            "model": args.model,
+            "model_server": args.model_server,
+            "mcp_url": args.mcp_url,
+        },
+    )
+
     for qid, qtext in tqdm(remaining, desc="Queries", unit="query"):
         messages = build_messages(
             query=qtext, system_prompt=args.system, query_template=args.query_template
         )
 
-        request_config = {
+        formatted_query = format_query(qtext, args.query_template)
+        per_query_config = {**base_req_config, "formatted_query": formatted_query}
+
+        request_conf = {
             "model": args.model,
             "model_server": args.model_server,
             "max_tokens": args.max_tokens,
@@ -217,7 +267,8 @@ def _process_tsv_dataset(tsv_path: str, agent: Assistant, args):
             for response_chunk in agent.run(messages=messages):
                 response = response_chunk
 
-            _persist_response(out_dir, request_config, response, query_id=qid)
+            _persist_response(out_dir, request_conf, response, query_id=qid,
+                              req_config=per_query_config)
         except Exception as exc:
             print(f"[Error] Query id={qid} failed: {exc}")
 
@@ -289,7 +340,19 @@ def main():
         query=args.query, system_prompt=args.system, query_template=args.query_template
     )
 
-    request_config = {
+    formatted_query = format_query(args.query, args.query_template)
+    req_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        formatted_query=formatted_query,
+        extra={
+            "model": args.model,
+            "model_server": args.model_server,
+            "mcp_url": args.mcp_url,
+        },
+    )
+
+    request_conf = {
         "model": args.model,
         "model_server": args.model_server,
         "max_tokens": args.max_tokens,
@@ -306,7 +369,8 @@ def main():
         response = response_chunk
         response_plain_text = typewriter_print(response_chunk, response_plain_text)
 
-    _persist_response(args.output_dir, request_config, response, query_id=None)
+    _persist_response(args.output_dir, request_conf, response, query_id=None,
+                      req_config=req_config)
 
     try:
         rprint(response)

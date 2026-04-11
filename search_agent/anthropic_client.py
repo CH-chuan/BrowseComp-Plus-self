@@ -18,6 +18,11 @@ load_dotenv(dotenv_path=script_env_path, override=False)
 
 from anthropic import Anthropic, APIError, RateLimitError
 from prompts import format_query
+from trajectory_utils import (
+    build_request_config,
+    build_trajectory_entry,
+    truncate_trajectory_tool_result,
+)
 from utils import extract_retrieved_docids_from_result
 
 MCP_BETA = "mcp-client-2025-04-04"
@@ -204,6 +209,19 @@ def main(args):
             "thinking_budget must be at least 1024 tokens when thinking is enabled."
         )
 
+    formatted_query = format_query(args.query, args.query_template)
+    req_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        formatted_query=formatted_query,
+        extra={
+            "mcp_url": args.mcp_url,
+            "mcp_name": args.mcp_name,
+            "thinking_enabled": thinking_enabled,
+            "thinking_budget": args.thinking_budget,
+        },
+    )
+
     request_body = build_request(
         query=args.query,
         model=args.model,
@@ -219,7 +237,9 @@ def main(args):
     )
 
     final_response = handle_complete_conversation(
-        client, request_body, args, max_pause_attempts=args.max_pause_attempts
+        client, request_body, args,
+        max_pause_attempts=args.max_pause_attempts,
+        request_config=req_config,
     )
 
     rprint(final_response)
@@ -232,11 +252,13 @@ def handle_complete_conversation(
     *,
     query_id: str | None = None,
     max_pause_attempts=5,
+    request_config: dict | None = None,
 ):
     request_body = initial_request_body.copy()
 
     query_message = initial_request_body["messages"][0]
     previous_responses = []
+    trajectory = []
 
     pause_restarts = 0
 
@@ -247,6 +269,63 @@ def handle_complete_conversation(
                 max_retries=args.max_rate_limit_retries,
                 delay=args.rate_limit_delay,
                 **request_body,
+            )
+
+            # Capture raw response for trajectory
+            try:
+                raw_response_dict = response.to_dict(mode="python")
+            except AttributeError:
+                try:
+                    raw_response_dict = response.model_dump(mode="python")
+                except AttributeError:
+                    raw_response_dict = None
+
+            turn_usage = None
+            if hasattr(response, "usage") and response.usage:
+                turn_usage = {
+                    "input_tokens": getattr(response.usage, "input_tokens", None),
+                    "output_tokens": getattr(response.usage, "output_tokens", None),
+                    "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", None),
+                    "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", None),
+                }
+
+            # Extract truncated tool results from this turn's content
+            turn_tool_results = []
+            if raw_response_dict:
+                for block in raw_response_dict.get("content", []):
+                    btype = block.get("type")
+                    if btype == "mcp_tool_result":
+                        # Find the matching mcp_tool_use for this result
+                        resp_id = block.get("tool_use_id")
+                        tool_name = None
+                        arguments = None
+                        for prev_block in raw_response_dict.get("content", []):
+                            if prev_block.get("type") == "mcp_tool_use" and prev_block.get("id") == resp_id:
+                                tool_name = prev_block.get("name")
+                                arguments = prev_block.get("input")
+                                break
+                        # Extract text from tool result content
+                        output_text = ""
+                        for part in block.get("content", []):
+                            if isinstance(part, dict) and part.get("text"):
+                                output_text += part["text"]
+                        turn_tool_results.append(
+                            truncate_trajectory_tool_result(
+                                call_id=resp_id,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                raw_output=output_text.strip() or None,
+                            )
+                        )
+
+            trajectory.append(
+                build_trajectory_entry(
+                    turn=i,
+                    raw_response=raw_response_dict,
+                    usage=turn_usage,
+                    stop_reason=response.stop_reason,
+                    tool_results=turn_tool_results,
+                )
             )
 
             previous_responses.append(
@@ -276,6 +355,8 @@ def handle_complete_conversation(
         query_id=query_id,
         pause_restarts=pause_restarts,
         store_raw=args.store_raw,
+        trajectory=trajectory,
+        request_config=request_config,
     )
 
     return response
@@ -289,6 +370,8 @@ def _persist_response(
     query_id: str | None = None,
     pause_restarts: int = 0,
     store_raw: bool = False,
+    trajectory: list | None = None,
+    request_config: dict | None = None,
 ):
 
     os.makedirs(out_dir, exist_ok=True)
@@ -413,6 +496,10 @@ def _persist_response(
 
     if store_raw:
         record["raw_response"] = response_dict
+    if request_config is not None:
+        record["request_config"] = request_config
+    if trajectory is not None:
+        record["trajectory"] = trajectory
 
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     filename = os.path.join(out_dir, f"run_{ts}.json")
@@ -455,12 +542,26 @@ def _process_tsv_dataset(tsv_path: str, client: Anthropic, args):
         f"Processing {len(remaining)} remaining queries (skipping {len(processed_ids)}) from {dataset_path} …"
     )
 
+    base_config = build_request_config(
+        system_prompt=args.system,
+        query_template=args.query_template,
+        extra={
+            "mcp_url": args.mcp_url,
+            "mcp_name": args.mcp_name,
+            "thinking_enabled": not args.no_thinking,
+            "thinking_budget": args.thinking_budget,
+        },
+    )
+
     def _handle_single_query(qid: str, qtext: str):
 
         iter_args = argparse.Namespace(**vars(args))
         iter_args.query = qtext
 
         thinking_enabled = not iter_args.no_thinking
+
+        formatted_query = format_query(qtext, iter_args.query_template)
+        per_query_config = {**base_config, "formatted_query": formatted_query}
 
         request_body = build_request(
             query=qtext,
@@ -483,6 +584,7 @@ def _process_tsv_dataset(tsv_path: str, client: Anthropic, args):
                 iter_args,
                 query_id=qid,
                 max_pause_attempts=iter_args.max_pause_attempts,
+                request_config=per_query_config,
             )
         except Exception as exc:
             print(f"[Error] Query id={qid} failed: {exc}")

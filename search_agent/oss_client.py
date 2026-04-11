@@ -16,6 +16,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from trajectory_utils import (
+    build_request_config,
+    build_trajectory_entry,
+    truncate_trajectory_tool_result,
+)
 from utils import extract_retrieved_docids_from_result
 
 from searcher.searchers import SearcherType
@@ -140,6 +145,7 @@ def run_conversation_with_tools(
 ):
 
     tool_usage = {}
+    trajectory = []
 
     messages = initial_request["input"]
 
@@ -161,6 +167,16 @@ def run_conversation_with_tools(
 
         response_dict = response.model_dump(mode="python")
 
+        # Capture per-turn usage
+        turn_usage = None
+        raw_usage = response_dict.get("usage")
+        if raw_usage:
+            turn_usage = {
+                "input_tokens": raw_usage.get("input_tokens"),
+                "output_tokens": raw_usage.get("output_tokens"),
+                "total_tokens": raw_usage.get("total_tokens"),
+            }
+
         messages.extend(response_dict["output"])
 
         if (
@@ -175,10 +191,20 @@ def run_conversation_with_tools(
         ]
 
         if not function_calls:
-            return messages, tool_usage, "completed"
+            trajectory.append(
+                build_trajectory_entry(
+                    turn=iteration - 1,
+                    raw_response=response_dict,
+                    usage=turn_usage,
+                    stop_reason=response_dict.get("status"),
+                    tool_results=[],
+                )
+            )
+            return messages, tool_usage, "completed", trajectory
 
         new_messages = messages.copy()
 
+        turn_tool_results = []
         for tool_call in function_calls:
             try:
                 arguments = json.loads(tool_call["arguments"])
@@ -193,6 +219,15 @@ def run_conversation_with_tools(
                     }
                 )
 
+                turn_tool_results.append(
+                    truncate_trajectory_tool_result(
+                        call_id=tool_call.get("call_id"),
+                        tool_name=tool_call["name"],
+                        arguments=arguments,
+                        raw_output=result,
+                    )
+                )
+
             except Exception as e:
                 error_msg = f"Error executing {tool_call['name']}: {str(e)}"
                 new_messages.append(
@@ -202,10 +237,30 @@ def run_conversation_with_tools(
                         "output": error_msg,
                     }
                 )
+
+                turn_tool_results.append(
+                    truncate_trajectory_tool_result(
+                        call_id=tool_call.get("call_id"),
+                        tool_name=tool_call["name"],
+                        arguments=arguments,
+                        raw_output=error_msg,
+                    )
+                )
+
+        trajectory.append(
+            build_trajectory_entry(
+                turn=iteration - 1,
+                raw_response=response_dict,
+                usage=turn_usage,
+                stop_reason="tool_calls",
+                tool_results=turn_tool_results,
+            )
+        )
+
         messages = new_messages
         iteration += 1
 
-    return messages, tool_usage, "incomplete"
+    return messages, tool_usage, "incomplete", trajectory
 
 
 def _persist_response(
@@ -216,6 +271,8 @@ def _persist_response(
     status: str,
     *,
     query_id: str | None = None,
+    trajectory: list | None = None,
+    request_config: dict | None = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -308,6 +365,11 @@ def _persist_response(
         "result": normalized_results,
     }
 
+    if request_config is not None:
+        normalized_record["request_config"] = request_config
+    if trajectory is not None:
+        normalized_record["trajectory"] = trajectory
+
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     filename = os.path.join(str(out_dir), f"run_{ts}.json")
     with open(filename, "w", encoding="utf-8") as f:
@@ -358,22 +420,33 @@ def _process_tsv_dataset(
     completed_lock = threading.Lock()
     completed_count = [0]
 
+    req_config = build_request_config(
+        query_template=args.query_template,
+        searcher_type=args.searcher_type,
+        snippet_max_tokens=args.snippet_max_tokens,
+        k=args.k,
+    )
+
     def _handle_single_query(qid: str, qtext: str, pbar=None):
         """Build request, send and persist response for one query."""
+
+        formatted_query = format_query(qtext, args.query_template)
 
         initial_request = {
             "model": args.model,
             "max_output_tokens": args.max_tokens,
             "input": [
-                {"role": "user", "content": format_query(qtext, args.query_template)}
+                {"role": "user", "content": formatted_query}
             ],
             "tools": tool_handler.get_tool_definitions(),
             "truncation": "auto",
             "reasoning": {"effort": args.reasoning_effort, "summary": "detailed"},
         }
 
+        per_query_config = {**req_config, "formatted_query": formatted_query}
+
         try:
-            messages, tool_usage, status = run_conversation_with_tools(
+            messages, tool_usage, status, trajectory = run_conversation_with_tools(
                 client, initial_request, tool_handler, args.max_iterations, args.verbose
             )
 
@@ -384,7 +457,10 @@ def _process_tsv_dataset(
                         pbar.set_postfix(completed=completed_count[0])
 
             _persist_response(
-                out_dir, initial_request, messages, tool_usage, status, query_id=qid
+                out_dir, initial_request, messages, tool_usage, status,
+                query_id=qid,
+                trajectory=trajectory,
+                request_config=per_query_config,
             )
 
         except Exception as exc:
@@ -535,9 +611,17 @@ def main():
 
     print("Processing single query", args.query)
 
-    args.query = format_query(args.query, args.query_template)
+    formatted_query = format_query(args.query, args.query_template)
+    req_config = build_request_config(
+        query_template=args.query_template,
+        formatted_query=formatted_query,
+        tool_definitions=tool_handler.get_tool_definitions(),
+        searcher_type=args.searcher_type,
+        snippet_max_tokens=args.snippet_max_tokens,
+        k=args.k,
+    )
 
-    messages = [{"role": "user", "content": args.query}]
+    messages = [{"role": "user", "content": formatted_query}]
 
     initial_request = {
         "model": args.model,
@@ -548,12 +632,15 @@ def main():
         "reasoning": {"effort": args.reasoning_effort, "summary": "detailed"},
     }
 
-    messages, tool_usage, status = run_conversation_with_tools(
+    messages, tool_usage, status, trajectory = run_conversation_with_tools(
         client, initial_request, tool_handler, args.max_iterations, args.verbose
     )
 
     _persist_response(
-        args.output_dir, initial_request, messages, tool_usage, status, query_id=None
+        args.output_dir, initial_request, messages, tool_usage, status,
+        query_id=None,
+        trajectory=trajectory,
+        request_config=req_config,
     )
 
     rprint(messages)

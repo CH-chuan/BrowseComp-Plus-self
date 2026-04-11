@@ -10,6 +10,7 @@ import re
 import time
 
 import pandas as pd
+from trajectory_utils import truncate_tool_output
 import requests
 import torch
 import transformers
@@ -269,6 +270,21 @@ If you find no further external knowledge needed, you can directly provide the a
         }
     )
 
+    # Build trajectory with truncated search results
+    trajectory = []
+    for turn_idx, step in enumerate(steps):
+        traj_entry = {
+            "turn": turn_idx,
+            "raw_content": step.get("content"),
+            "think": step.get("think"),
+        }
+        if step.get("search"):
+            truncated = truncate_tool_output("search", step.get("information"))
+            traj_entry["search_query"] = step["search"]
+            traj_entry["search_result"] = truncated
+            traj_entry["docids"] = step.get("docids", [])
+        trajectory.append(traj_entry)
+
     conversation_data = {
         "metadata": {
             "model": args.model,
@@ -279,6 +295,12 @@ If you find no further external knowledge needed, you can directly provide the a
         "status": "completed" if final_answer else "incomplete",
         "retrieved_docids": list(retrieved_docids),
         "result": normalized_results,
+        "request_config": {
+            "system_prompt": None,
+            "query_template": "search_r1_builtin",
+            "formatted_query": prompt,
+        },
+        "trajectory": trajectory,
     }
 
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
