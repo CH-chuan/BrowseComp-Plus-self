@@ -30,13 +30,21 @@ case "$MODEL" in
   *)         MAX_LEN="${MAX_LEN:-8192}" ;;
 esac
 
+# Whether to attach the qwen3 reasoning parser. Off by default because we run
+# in non-thinking mode (extra_body.chat_template_kwargs.enable_thinking=False);
+# attaching it while non-thinking causes vLLM to misclassify subsequent-turn
+# assistant outputs (including embedded <tool_call> XML) as a single
+# "reasoning" item, so the tool-call parser never sees the XML.
+# Set REASONING_PARSER=qwen3 to re-attach when running thinking-on experiments.
+REASONING_PARSER="${REASONING_PARSER:-}"
+
 echo "=== vLLM launch ==="
-echo "  model:          $MODEL"
-echo "  port:           $PORT"
-echo "  tool-parser:    $TOOL_PARSER"
-echo "  reasoning-parser: qwen3"
-echo "  max-model-len:  $MAX_LEN"
-echo "  gpu-util:       $GPU_UTIL"
+echo "  model:            $MODEL"
+echo "  port:             $PORT"
+echo "  tool-parser:      $TOOL_PARSER"
+echo "  reasoning-parser: ${REASONING_PARSER:-(none)}"
+echo "  max-model-len:    $MAX_LEN"
+echo "  gpu-util:         $GPU_UTIL"
 echo "==================="
 
 # Restart-safe: kill any existing vLLM server before launching the new one.
@@ -55,16 +63,22 @@ if pgrep -f "vllm serve" > /dev/null; then
   fi
 fi
 
+CMD=(
+  /home/cche/miniforge3/envs/browsecomp/bin/vllm serve "$MODEL"
+  --port "$PORT"
+  --enable-auto-tool-choice
+  --tool-call-parser "$TOOL_PARSER"
+  --max-model-len "$MAX_LEN"
+  --enforce-eager
+  --gpu-memory-utilization "$GPU_UTIL"
+)
+if [ -n "$REASONING_PARSER" ]; then
+  CMD+=( --reasoning-parser "$REASONING_PARSER" )
+fi
+
 exec env \
   LD_LIBRARY_PATH=/home/cche/miniforge3/envs/browsecomp/lib \
   PATH=/home/cche/miniforge3/envs/browsecomp/bin:"$PATH" \
   PYTHONNOUSERSITE=1 \
   HF_HOME=/home/cche/projects/models \
-  /home/cche/miniforge3/envs/browsecomp/bin/vllm serve "$MODEL" \
-    --port "$PORT" \
-    --enable-auto-tool-choice \
-    --tool-call-parser "$TOOL_PARSER" \
-    --reasoning-parser qwen3 \
-    --max-model-len "$MAX_LEN" \
-    --enforce-eager \
-    --gpu-memory-utilization "$GPU_UTIL"
+  "${CMD[@]}"

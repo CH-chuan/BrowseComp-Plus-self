@@ -13,4 +13,5 @@ evals/
 .claude/
 logs/
 output-test/
+output-runs/
 nohup.out
