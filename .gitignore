@@ -10,3 +10,7 @@ data/browsecomp_plus_decrypted.jsonl
 topics-qrels/queries.tsv
 runs/
 evals/
+.claude/
+logs/
+output-test/
+nohup.out

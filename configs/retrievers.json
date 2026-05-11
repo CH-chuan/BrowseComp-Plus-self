@@ -1,0 +1,27 @@
+{
+  "retrievers": [
+    {
+      "name": "bm25",
+      "type": "bm25",
+      "description": "Lexical BM25 over a Lucene index. Best for queries with exact terms, names, dates, codes, or rare strings.",
+      "args": {
+        "index_path": "indexes/bm25"
+      }
+    },
+    {
+      "name": "qwen3_dense",
+      "type": "faiss",
+      "description": "Dense retrieval via Qwen3-Embedding-0.6B. Best for semantic / paraphrased questions where exact lexical match is unlikely.",
+      "args": {
+        "index_path": "indexes/qwen3-embedding-0.6b/corpus.*.pkl",
+        "model_name": "Qwen/Qwen3-Embedding-0.6B",
+        "normalize": true,
+        "pooling": "eos",
+        "torch_dtype": "float16",
+        "dataset_name": "Tevatron/browsecomp-plus-corpus",
+        "task_prefix": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+        "max_length": 8192
+      }
+    }
+  ]
+}

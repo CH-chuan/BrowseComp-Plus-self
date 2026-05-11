@@ -22,6 +22,7 @@ from trajectory_utils import (
 )
 from utils import extract_retrieved_docids_from_result
 
+from multi_retriever_tool import MultiRetrieverToolHandler, load_retrievers_config
 from searcher.searchers import SearcherType
 
 
@@ -498,6 +499,11 @@ def _process_tsv_dataset(
         searcher_type=args.searcher_type,
         snippet_max_tokens=args.snippet_max_tokens,
         k=args.k,
+        extra=(
+            {"retrievers": getattr(args, "retriever_metadata", None)}
+            if getattr(args, "retriever_metadata", None)
+            else None
+        ),
     )
 
     def _handle_single_query(qid: str, qtext: str, pbar=None):
@@ -638,8 +644,23 @@ def main():
     parser.add_argument(
         "--searcher-type",
         choices=SearcherType.get_choices(),
-        required=True,
-        help=f"Type of searcher to use: {', '.join(SearcherType.get_choices())}",
+        required=False,
+        default=None,
+        help=(
+            f"Type of searcher to use: {', '.join(SearcherType.get_choices())}. "
+            "Required unless --retrievers-config is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--retrievers-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON config listing multiple retrievers. When set, the agent "
+            "is given a `search` tool with a required `retriever` argument and may "
+            "pick which retriever to call per query. Mutually exclusive with "
+            "--searcher-type."
+        ),
     )
 
     # Server configuration arguments
@@ -672,8 +693,21 @@ def main():
     )
 
     temp_args, _ = parser.parse_known_args()
-    searcher_class = SearcherType.get_searcher_class(temp_args.searcher_type)
-    searcher_class.parse_args(parser)
+
+    if temp_args.retrievers_config and temp_args.searcher_type:
+        parser.error(
+            "--retrievers-config and --searcher-type are mutually exclusive; "
+            "pick one."
+        )
+    if not temp_args.retrievers_config and not temp_args.searcher_type:
+        parser.error(
+            "Either --searcher-type or --retrievers-config must be supplied."
+        )
+
+    searcher_class = None
+    if temp_args.searcher_type:
+        searcher_class = SearcherType.get_searcher_class(temp_args.searcher_type)
+        searcher_class.parse_args(parser)
 
     args = parser.parse_args()
 
@@ -692,24 +726,47 @@ def main():
 
     client = openai.OpenAI(api_key=api_key)
 
-    searcher = searcher_class(args)
+    retriever_metadata = None
 
-    tool_handler = SearchToolHandler(
-        searcher=searcher,
-        snippet_max_tokens=args.snippet_max_tokens,
-        k=args.k,
-        include_get_document=args.get_document,
-    )
+    if args.retrievers_config:
+        if args.get_document:
+            parser.error(
+                "--get-document is not supported in multi-retriever mode (v1). "
+                "Drop --get-document or use --searcher-type."
+            )
+        retriever_configs = load_retrievers_config(args.retrievers_config)
+        tool_handler = MultiRetrieverToolHandler(
+            configs=retriever_configs,
+            snippet_max_tokens=args.snippet_max_tokens,
+            k=args.k,
+            include_get_document=False,
+        )
+        retriever_metadata = tool_handler.metadata()
+        args.retriever_metadata = retriever_metadata
+        names = ", ".join(f"{m['name']}({m['type']})" for m in retriever_metadata)
+        print(
+            f"Search agent started in multi-retriever mode with {len(retriever_metadata)} "
+            f"retrievers: {names} (snippet_max_tokens={args.snippet_max_tokens}, k={args.k})"
+        )
+        print("Registered tools: search (with `retriever` arg)")
+    else:
+        searcher = searcher_class(args)
+        tool_handler = SearchToolHandler(
+            searcher=searcher,
+            snippet_max_tokens=args.snippet_max_tokens,
+            k=args.k,
+            include_get_document=args.get_document,
+        )
 
-    tools_registered = ["search"]
-    if args.get_document:
-        tools_registered.append("get_document")
-    tools_str = ", ".join(tools_registered)
+        tools_registered = ["search"]
+        if args.get_document:
+            tools_registered.append("get_document")
+        tools_str = ", ".join(tools_registered)
 
-    print(
-        f"Search agent started with {searcher.search_type} search (snippet_max_tokens={args.snippet_max_tokens}, k={args.k})"
-    )
-    print(f"Registered tools: {tools_str}")
+        print(
+            f"Search agent started with {searcher.search_type} search (snippet_max_tokens={args.snippet_max_tokens}, k={args.k})"
+        )
+        print(f"Registered tools: {tools_str}")
 
     if isinstance(args.query, str):
         qstr = args.query.strip()
@@ -733,6 +790,7 @@ def main():
         searcher_type=args.searcher_type,
         snippet_max_tokens=args.snippet_max_tokens,
         k=args.k,
+        extra=({"retrievers": retriever_metadata} if retriever_metadata else None),
     )
 
     request_body = build_request(
