@@ -177,7 +177,7 @@ class FaissSearcher(BaseSearcher):
             lora_name_or_path=model_args.lora_name_or_path,
             cache_dir=model_args.cache_dir,
             torch_dtype=torch_dtype,
-            attn_implementation=model_args.attn_implementation,
+            attn_implementation="sdpa",
         )
 
         self.model = self.model.to("cuda" if torch.cuda.is_available() else "cpu")
