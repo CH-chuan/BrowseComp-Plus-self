@@ -860,6 +860,9 @@ def main():
                              "for the full 830 queries).")
     parser.add_argument("--limit", type=int, default=None,
                         help="Process only the first N queries from --dataset (smoke runs).")
+    parser.add_argument("--reverse-dataset", action="store_true",
+                        help="Process queries in reverse order (last entry first). Useful for "
+                             "splitting a sweep between two machines that meet in the middle.")
     parser.add_argument("--gold-source", choices=["gold", "evidence", "union"], default="gold",
                         help="Score recall against gold_docs (strict), evidence_docs (loose), or the union.")
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
@@ -944,6 +947,9 @@ def main():
 
     records = load_dataset_jsonl(args.dataset)
     print(f"Loaded {len(records)} queries from {args.dataset}")
+    if args.reverse_dataset:
+        records = list(reversed(records))
+        print(f"--reverse-dataset -> processing in reverse order (last query first)")
     if args.limit:
         records = records[: args.limit]
         print(f"--limit {args.limit} -> processing first {len(records)} queries")
